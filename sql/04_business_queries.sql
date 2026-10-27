@@ -168,3 +168,96 @@ SELECT delay_bucket,
 FROM bucketed
 GROUP BY delay_bucket
 ORDER BY delay_bucket;
+
+-- Q4 base: one row per (seller, order) with a review.
+-- Grain: seller-order. An order with items from 2 sellers appears twice, and
+-- its single review counts for both sellers (the review is about the order,
+-- we cannot split it). Revenue = SUM(price) of that seller's items.
+-- Delivered orders with a delivery date, in the window, with a review.
+-- One review per order: latest by review_creation_date (DECISIONS.md).
+-- A temp view lives only for this psql session, it does not change the database.
+CREATE OR REPLACE TEMP VIEW seller_order_base AS
+WITH latest_review AS (
+    SELECT DISTINCT ON (order_id) order_id, review_score
+    FROM order_reviews
+    ORDER BY order_id, review_creation_date DESC, review_answer_timestamp DESC
+)
+SELECT i.seller_id,
+       o.order_id,
+       SUM(i.price) AS revenue,
+       (o.order_delivered_customer_date::date - o.order_estimated_delivery_date::date) AS days_vs_estimate,
+       r.review_score
+FROM order_items i
+JOIN orders o        ON o.order_id = i.order_id
+JOIN latest_review r ON r.order_id = o.order_id
+WHERE o.order_status = 'delivered'
+  AND o.order_delivered_customer_date IS NOT NULL
+  AND o.order_purchase_timestamp >= '2017-01-01'
+  AND o.order_purchase_timestamp <  '2018-09-01'
+GROUP BY i.seller_id, o.order_id, o.order_delivered_customer_date,
+         o.order_estimated_delivery_date, r.review_score;
+
+-- Q4.1 Seller scorecard: sellers with the MOST bad reviews (volume view)
+SELECT b.seller_id,
+       s.seller_state,
+       COUNT(*)                                                        AS orders,
+       ROUND(SUM(b.revenue), 2)                                        AS revenue,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE b.days_vs_estimate > 0) / COUNT(*), 1) AS late_pct,
+       ROUND(AVG(b.review_score), 2)                                   AS avg_review,
+       COUNT(*) FILTER (WHERE b.review_score <= 2)                     AS bad_reviews,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE b.review_score <= 2) / COUNT(*), 1) AS pct_bad
+FROM seller_order_base b
+JOIN sellers s ON s.seller_id = b.seller_id
+GROUP BY b.seller_id, s.seller_state
+ORDER BY bad_reviews DESC
+LIMIT 15;
+
+-- Q4.2 Seller scorecard: WORST bad-review RATE, only sellers with 50+ orders
+-- The minimum avoids tiny sellers (2 orders, 1 bad review = 50%) topping the list.
+SELECT b.seller_id,
+       s.seller_state,
+       COUNT(*)                                                        AS orders,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE b.days_vs_estimate > 0) / COUNT(*), 1) AS late_pct,
+       ROUND(AVG(b.review_score), 2)                                   AS avg_review,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE b.review_score <= 2) / COUNT(*), 1) AS pct_bad
+FROM seller_order_base b
+JOIN sellers s ON s.seller_id = b.seller_id
+GROUP BY b.seller_id, s.seller_state
+HAVING COUNT(*) >= 50
+ORDER BY pct_bad DESC
+LIMIT 15;
+
+-- Q4.3 Categories: bad reviews by category, only categories with 100+ orders
+-- Grain: category-order (an order with 2 categories counts in both, and its
+-- review counts for both, same logic as the seller view).
+WITH latest_review AS (
+    SELECT DISTINCT ON (order_id) order_id, review_score
+    FROM order_reviews
+    ORDER BY order_id, review_creation_date DESC, review_answer_timestamp DESC
+),
+category_orders AS (
+    SELECT DISTINCT
+           i.order_id,
+           COALESCE(t.product_category_name_english, 'unknown') AS category,
+           r.review_score
+    FROM order_items i
+    JOIN orders o        ON o.order_id = i.order_id
+    JOIN latest_review r ON r.order_id = o.order_id
+    LEFT JOIN products p ON p.product_id = i.product_id
+    LEFT JOIN product_category_translation t
+           ON t.product_category_name = p.product_category_name
+    WHERE o.order_status = 'delivered'
+      AND o.order_delivered_customer_date IS NOT NULL
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+)
+SELECT category,
+       COUNT(*)                                                        AS orders,
+       ROUND(AVG(review_score), 2)                                     AS avg_review,
+       COUNT(*) FILTER (WHERE review_score <= 2)                       AS bad_reviews,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE review_score <= 2) / COUNT(*), 1) AS pct_bad
+FROM category_orders
+GROUP BY category
+HAVING COUNT(*) >= 100
+ORDER BY pct_bad DESC
+LIMIT 15;
