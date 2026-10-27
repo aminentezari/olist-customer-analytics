@@ -261,3 +261,71 @@ GROUP BY category
 HAVING COUNT(*) >= 100
 ORDER BY pct_bad DESC
 LIMIT 15;
+
+-- Q5.1 Repeat purchase rate
+-- Grain: customer (customer_unique_id). Delivered orders in the window.
+-- Repeat customer = 2 or more delivered orders in the window.
+WITH cust_orders AS (
+    SELECT c.customer_unique_id, COUNT(*) AS n_orders
+    FROM orders o
+    JOIN customers c ON c.customer_id = o.customer_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+    GROUP BY c.customer_unique_id
+)
+SELECT COUNT(*)                                          AS customers,
+       COUNT(*) FILTER (WHERE n_orders >= 2)             AS repeat_customers,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE n_orders >= 2) / COUNT(*), 2) AS repeat_rate_pct
+FROM cust_orders;
+
+-- Q5.2 Cohort retention by first-purchase month
+-- Grain: customer. Cohort = month of the customer's first delivered order.
+-- months_since_first = months between the first order and a later order.
+-- Shows, for each cohort, how many customers ordered again in month +1, +2...
+WITH orders_c AS (
+    SELECT c.customer_unique_id,
+           DATE_TRUNC('month', o.order_purchase_timestamp)::date AS order_month
+    FROM orders o
+    JOIN customers c ON c.customer_id = o.customer_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+),
+first_month AS (
+    SELECT customer_unique_id, MIN(order_month) AS cohort_month
+    FROM orders_c
+    GROUP BY customer_unique_id
+),
+activity AS (
+    SELECT f.cohort_month,
+           (EXTRACT(YEAR FROM o.order_month) - EXTRACT(YEAR FROM f.cohort_month)) * 12
+         + (EXTRACT(MONTH FROM o.order_month) - EXTRACT(MONTH FROM f.cohort_month)) AS months_since_first,
+           o.customer_unique_id
+    FROM orders_c o
+    JOIN first_month f USING (customer_unique_id)
+)
+SELECT cohort_month,
+       COUNT(DISTINCT customer_unique_id) FILTER (WHERE months_since_first = 0) AS cohort_size,
+       COUNT(DISTINCT customer_unique_id) FILTER (WHERE months_since_first = 1) AS m1,
+       COUNT(DISTINCT customer_unique_id) FILTER (WHERE months_since_first = 3) AS m3,
+       COUNT(DISTINCT customer_unique_id) FILTER (WHERE months_since_first = 6) AS m6
+FROM activity
+GROUP BY cohort_month
+ORDER BY cohort_month;
+
+-- Q5.3 Payment types and installments
+-- Grain: payment row (an order can have several payments).
+-- Share is by number of payments and by value.
+SELECT p.payment_type,
+       COUNT(*)                                                   AS payments,
+       ROUND(100.0 * COUNT(*) / SUM(COUNT(*)) OVER (), 1)         AS pct_payments,
+       ROUND(SUM(p.payment_value), 2)                             AS total_value,
+       ROUND(AVG(p.payment_installments), 1)                      AS avg_installments
+FROM order_payments p
+JOIN orders o ON o.order_id = p.order_id
+WHERE o.order_status = 'delivered'
+  AND o.order_purchase_timestamp >= '2017-01-01'
+  AND o.order_purchase_timestamp <  '2018-09-01'
+GROUP BY p.payment_type
+ORDER BY payments DESC;
