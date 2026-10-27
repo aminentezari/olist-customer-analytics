@@ -83,3 +83,88 @@ SELECT RANK() OVER (ORDER BY SUM(revenue) DESC)                 AS rank,
 FROM order_revenue
 GROUP BY customer_state
 ORDER BY rank;
+
+-- Q3.1 Delivery performance by month
+-- Grain: order. Only delivered orders with a delivery date, in the window.
+-- Late = delivered on a later DATE than the estimated date. We compare dates,
+-- not timestamps, because the estimate is a date and delivery has a time.
+WITH delivery AS (
+    SELECT o.order_id,
+           o.order_purchase_timestamp,
+           (o.order_delivered_customer_date::date - o.order_estimated_delivery_date::date) AS days_vs_estimate,
+           EXTRACT(EPOCH FROM (o.order_delivered_customer_date - o.order_purchase_timestamp)) / 86400.0 AS delivery_days
+    FROM orders o
+    WHERE o.order_status = 'delivered'
+      AND o.order_delivered_customer_date IS NOT NULL
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+)
+SELECT DATE_TRUNC('month', order_purchase_timestamp)::date AS month,
+       COUNT(*)                                            AS orders,
+       ROUND(AVG(delivery_days), 1)                        AS avg_delivery_days,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE days_vs_estimate > 0) / COUNT(*), 1) AS late_pct
+FROM delivery
+GROUP BY 1
+ORDER BY 1;
+
+-- Q3.2 Delivery performance by customer state
+-- Same grain and filters as Q3.1. Small states have few orders: read with care.
+WITH delivery AS (
+    SELECT o.order_id,
+           c.customer_state,
+           (o.order_delivered_customer_date::date - o.order_estimated_delivery_date::date) AS days_vs_estimate,
+           EXTRACT(EPOCH FROM (o.order_delivered_customer_date - o.order_purchase_timestamp)) / 86400.0 AS delivery_days
+    FROM orders o
+    JOIN customers c ON c.customer_id = o.customer_id
+    WHERE o.order_status = 'delivered'
+      AND o.order_delivered_customer_date IS NOT NULL
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+)
+SELECT customer_state,
+       COUNT(*)                                     AS orders,
+       ROUND(AVG(delivery_days), 1)                 AS avg_delivery_days,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE days_vs_estimate > 0) / COUNT(*), 1) AS late_pct
+FROM delivery
+GROUP BY customer_state
+ORDER BY late_pct DESC;
+
+-- Q3.3 Average review score and % bad reviews by delay bucket
+-- Grain: order. One review per order: the latest by review_creation_date,
+-- ties broken by review_answer_timestamp (rule from DECISIONS.md).
+-- Orders without a review drop out through the inner join.
+-- Bad review = score 1 or 2.
+WITH latest_review AS (
+    SELECT DISTINCT ON (order_id)
+           order_id, review_score
+    FROM order_reviews
+    ORDER BY order_id, review_creation_date DESC, review_answer_timestamp DESC
+),
+delivery AS (
+    SELECT o.order_id,
+           (o.order_delivered_customer_date::date - o.order_estimated_delivery_date::date) AS days_vs_estimate
+    FROM orders o
+    WHERE o.order_status = 'delivered'
+      AND o.order_delivered_customer_date IS NOT NULL
+      AND o.order_purchase_timestamp >= '2017-01-01'
+      AND o.order_purchase_timestamp <  '2018-09-01'
+),
+bucketed AS (
+    SELECT d.order_id,
+           r.review_score,
+           CASE WHEN d.days_vs_estimate < 0              THEN '1 early'
+                WHEN d.days_vs_estimate = 0              THEN '2 on time'
+                WHEN d.days_vs_estimate BETWEEN 1 AND 3  THEN '3 late 1-3 days'
+                WHEN d.days_vs_estimate BETWEEN 4 AND 7  THEN '4 late 4-7 days'
+                ELSE                                          '5 late 8+ days'
+           END AS delay_bucket
+    FROM delivery d
+    JOIN latest_review r ON r.order_id = d.order_id
+)
+SELECT delay_bucket,
+       COUNT(*)                                                   AS orders,
+       ROUND(AVG(review_score), 2)                                AS avg_review,
+       ROUND(100.0 * COUNT(*) FILTER (WHERE review_score <= 2) / COUNT(*), 1) AS pct_bad_reviews
+FROM bucketed
+GROUP BY delay_bucket
+ORDER BY delay_bucket;
