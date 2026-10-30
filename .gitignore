@@ -5,3 +5,4 @@ __pycache__/
 .env
 data/*.csv
 excel/*.csv
+powerbi/data/
